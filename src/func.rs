@@ -8,7 +8,7 @@ pub trait LazyFn<E: Effect, Args: Send + 'static>: Sized + Send + 'static {
 
     fn call_inner(&self, args: Args) -> impl Lazy<E, Output = Self::Output>;
 
-    fn call_lazy<E2>(&self, args: Args) -> impl Lazy<E2, Output = Self::Output>
+    fn awaken<E2>(&self, args: Args) -> impl Lazy<E2, Output = Self::Output>
     where
         E2: Contains<E>,
     {

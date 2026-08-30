@@ -9,6 +9,7 @@ pub mod effect;
 pub mod error;
 pub mod func;
 pub mod global;
+pub mod iter;
 pub mod lazy;
 pub mod module;
 
