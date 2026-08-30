@@ -622,3 +622,96 @@ pub enum ModuleError {
     #[error("module with id '{id}' has not been loaded, but an action is requesting it")]
     NotFound { id: &'static NamespacedIdRef },
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        effect::{Effect, Fallibility, Fallible, Pure},
+        global::GlobalState,
+        lazy::{Laze, Lazy, LazyContext, LazyFallible, LazyResult},
+    };
+
+    async fn run<E: Effect, L: Lazy<E, Output = T>, T: Send + 'static>(
+        lazy: L,
+    ) -> <E::Fallibility as Fallibility>::MapOutput<T> {
+        let state = GlobalState::default();
+        let context = LazyContext { state: &state };
+
+        let output = lazy.get(context).await;
+        output.value
+    }
+
+    macro_rules! assert_lazy_eq {
+        ($left:expr, $right:expr) => {
+            assert_lazy_eq!(Pure => ($left, $right))
+        };
+        ($effect:ty => ($left:expr, $right:expr)) => {
+            async {
+                assert_eq!(run::<$effect, _, _>($left).await, $right);
+            }
+        };
+    }
+
+    #[tokio::test]
+    async fn just() {
+        assert_lazy_eq!(Laze::just(5), 5).await;
+    }
+
+    #[tokio::test]
+    async fn lazy() {
+        assert_lazy_eq!(Laze::lazy(|| 5), 5).await;
+    }
+
+    #[tokio::test]
+    async fn future() {
+        assert_lazy_eq!(Laze::future(async { 5 }), 5).await;
+    }
+
+    #[tokio::test]
+    async fn map() {
+        assert_lazy_eq!(Laze::just(5).map(|x| x + 1), 6).await;
+    }
+
+    #[tokio::test]
+    async fn then() {
+        assert_lazy_eq!(Laze::just(5).then(|x| Laze::just(x + 1)), 6).await;
+
+        assert_lazy_eq!(
+            Laze::future(async { 5 }).then(|x| Laze::future(async move { x + 1 })),
+            6
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn throw() {
+        assert_lazy_eq!(Fallible::<()> => (
+            Laze::just(Err(())).throw(),
+            Result::<(), ()>::Err(())
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn then_fallible() {
+        assert_lazy_eq!(Fallible::<()> => (
+            Laze::just(()).then(|()| Laze::just(Err(())).throw()),
+            Result::<(), ()>::Err(())
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn throw_catch() {
+        assert_lazy_eq!(
+            Laze::just(Err(())).throw().catch(),
+            Result::<(), ()>::Err(())
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn boxed() {
+        assert_lazy_eq!(Laze::just(5).boxed(), 5).await;
+    }
+}
