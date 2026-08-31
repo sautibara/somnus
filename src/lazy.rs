@@ -13,6 +13,12 @@ use crate::{
     module::Module,
 };
 
+// TODO: Lazy::looping - accepts an fn that takes in some Continue lazy
+// - implements this by adding a new looping effect
+// - may have multiple loops by stacking effects
+// - continue lazy actually returns some break output that continues the loop
+//   - can't have a recursive function because we can't use the lazy's output (since it breaks)
+
 #[macro_export]
 #[doc(hidden)]
 macro_rules! run_lazy_inner {
@@ -27,7 +33,7 @@ macro_rules! run_lazy_inner {
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct LazyContext<'a> {
-    state: &'a GlobalState,
+    pub(crate) state: &'a GlobalState,
 }
 
 #[doc(hidden)]

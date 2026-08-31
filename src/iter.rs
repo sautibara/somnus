@@ -348,6 +348,146 @@ pub trait LazyIter<E: Effect>:
         self.map(map).flatten()
     }
 
+    fn zip<T, I>(self, iter: I) -> impl LazyIter<E, Item = (Self::Item, T)>
+    where
+        E: Contains<Pure>,
+        I: IntoLazyIter<E, IntoItem = T>,
+        T: Send + 'static,
+    {
+        struct Zip<IL, IR> {
+            left: IL,
+            right: IR,
+        }
+
+        impl<E, IL, IR, TL, TR> LazyIter<E> for Zip<IL, IR>
+        where
+            E: Contains<Pure>,
+            IL: LazyIter<E, Item = TL>,
+            IR: LazyIter<E, Item = TR>,
+            TL: Send + 'static,
+            TR: Send + 'static,
+        {
+            type Item = (TL, TR);
+            fn next(
+                self,
+            ) -> impl Lazy<E, Output = (Option<impl Lazy<E, Output = Self::Item>>, Self)>
+            {
+                let Self { left, right } = self;
+                left.next().then(|(left_next, left)| {
+                    if let Some(left_next) = left_next {
+                        right
+                            .next()
+                            .map(|(right_next, right)| {
+                                if let Some(right_next) = right_next {
+                                    let next = left_next.then(|left_next| {
+                                        right_next.map(|right_next| (left_next, right_next))
+                                    });
+
+                                    (Some(next), Self { left, right })
+                                } else {
+                                    (None, Self { left, right })
+                                }
+                            })
+                            .left()
+                    } else {
+                        Laze::just((None, Self { left, right })).right()
+                    }
+                })
+            }
+        }
+
+        impl<E, IL, IR, TL, TR> IntoLazyIter<E> for Zip<IL, IR>
+        where
+            E: Contains<Pure>,
+            IL: LazyIter<E, Item = TL>,
+            IR: LazyIter<E, Item = TR>,
+            TL: Send + 'static,
+            TR: Send + 'static,
+        {
+            type IntoItem = (TL, TR);
+            fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
+                self
+            }
+        }
+
+        Zip {
+            left: self,
+            right: iter.into_lazy_iter(),
+        }
+    }
+
+    fn enumerate(self) -> impl LazyIter<E, Item = (usize, Self::Item)>
+    where
+        E: Contains<Pure>,
+    {
+        (0..).into_lazy_iter().zip(self)
+    }
+
+    fn cmp<I>(self, iter: I) -> impl Lazy<E, Output = std::cmp::Ordering>
+    where
+        E: Contains<Pure>,
+        I: IntoLazyIter<E, IntoItem = Self::Item>,
+        Self::Item: Ord,
+    {
+        struct Cmp<IL, IR> {
+            left: IL,
+            right: IR,
+        }
+
+        impl<E, IL, IR, T> Lazy<E> for Cmp<IL, IR>
+        where
+            E: Contains<Pure>,
+            IL: LazyIter<E, Item = T>,
+            IR: LazyIter<E, Item = T>,
+            T: Ord + Send + 'static,
+        {
+            type Output = std::cmp::Ordering;
+
+            async fn get(
+                self,
+                context: crate::lazy::LazyContext<'_>,
+            ) -> LazyOutput<E, Self::Output> {
+                let Self {
+                    mut left,
+                    mut right,
+                } = self;
+
+                loop {
+                    let (left_next, left_new) = run_lazy_inner!(left.next(), context);
+                    left = left_new;
+
+                    let (right_next, right_new) = run_lazy_inner!(right.next(), context);
+                    right = right_new;
+
+                    let ordering = match (left_next, right_next) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (Some(_), None) => std::cmp::Ordering::Greater,
+                        (None, Some(_)) => std::cmp::Ordering::Less,
+                        (Some(left_next), Some(right_next)) => {
+                            let left_next = run_lazy_inner!(left_next, context);
+                            let right_next = run_lazy_inner!(right_next, context);
+
+                            let ordering = left_next.cmp(&right_next);
+                            if ordering.is_eq() {
+                                continue;
+                            }
+                            ordering
+                        }
+                    };
+
+                    return LazyOutput {
+                        value: E::Fallibility::pure(ordering),
+                    };
+                }
+            }
+        }
+
+        Cmp {
+            left: self,
+            right: iter.into_lazy_iter(),
+        }
+    }
+
     fn fold_lazy<T, L, F>(self, value: T, mut f: F) -> impl Lazy<E, Output = (T, Self)>
     where
         E: Contains<Pure>,
@@ -587,6 +727,13 @@ impl<E: Contains<Pure>, T: Send + 'static> IntoLazyIter<E> for Vec<T> {
     }
 }
 
+impl<E: Contains<Pure>, T: Send + 'static, const LEN: usize> IntoLazyIter<E> for [T; LEN] {
+    type IntoItem = T;
+    fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
+        LazeIter::from_iter(self)
+    }
+}
+
 impl<E, K, V, S> IntoLazyIter<E> for HashMap<K, V, S>
 where
     E: Contains<Pure>,
@@ -595,6 +742,42 @@ where
     S: Send + 'static,
 {
     type IntoItem = (K, V);
+    fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
+        LazeIter::from_iter(self)
+    }
+}
+
+impl<E, T> IntoLazyIter<E> for std::ops::Range<T>
+where
+    E: Contains<Pure>,
+    T: Send + 'static,
+    Self: Iterator<Item = T>,
+{
+    type IntoItem = T;
+    fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
+        LazeIter::from_iter(self)
+    }
+}
+
+impl<E, T> IntoLazyIter<E> for std::ops::RangeFrom<T>
+where
+    E: Contains<Pure>,
+    T: Send + 'static,
+    Self: Iterator<Item = T>,
+{
+    type IntoItem = T;
+    fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
+        LazeIter::from_iter(self)
+    }
+}
+
+impl<E, T> IntoLazyIter<E> for std::ops::RangeInclusive<T>
+where
+    E: Contains<Pure>,
+    T: Send + 'static,
+    Self: Iterator<Item = T>,
+{
+    type IntoItem = T;
     fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
         LazeIter::from_iter(self)
     }
@@ -710,5 +893,65 @@ where
                 None => (Ok(collection), iter),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+
+    use crate::{
+        effect::{Contains, Fallibility, Pure},
+        global::GlobalState,
+        iter::{IntoLazyIter, LazyIter},
+        lazy::{Lazy, LazyContext},
+    };
+
+    async fn cmp<E, IL, IR, T>(
+        left: IL,
+        right: IR,
+    ) -> <E::Fallibility as Fallibility>::MapOutput<std::cmp::Ordering>
+    where
+        E: Contains<Pure>,
+        IL: IntoLazyIter<E, IntoItem = T>,
+        IR: IntoLazyIter<E, IntoItem = T>,
+        T: Ord + Send + 'static,
+    {
+        let state = GlobalState::default();
+        let context = LazyContext { state: &state };
+
+        let ordering = IntoLazyIter::<E>::into_lazy_iter(left).cmp(right);
+        let ordering = ordering.get(context).await;
+
+        ordering.value
+    }
+
+    macro_rules! assert_iter_cmp_eq {
+        ($left:expr, $right:expr, $cmp:expr) => {
+            assert_iter_cmp_eq!(Pure => ($left, $right, $cmp))
+        };
+        ($effect:ty => ($left:expr, $right:expr, $cmp:expr)) => {
+            async {
+                assert_eq!(cmp::<$effect, _, _, _>($left, $right).await, $cmp);
+            }
+        };
+    }
+
+    #[tokio::test]
+    async fn cmp_test() {
+        assert_iter_cmp_eq!([], [0], Ordering::Less).await;
+        assert_iter_cmp_eq!([] as [usize; 0], [], Ordering::Equal).await;
+        assert_iter_cmp_eq!([0], [], Ordering::Greater).await;
+
+        assert_iter_cmp_eq!([0], [1], Ordering::Less).await;
+        assert_iter_cmp_eq!([0], [0], Ordering::Equal).await;
+        assert_iter_cmp_eq!([1], [0], Ordering::Greater).await;
+
+        assert_iter_cmp_eq!([0], [0, 0], Ordering::Less).await;
+        assert_iter_cmp_eq!([0, 0], [0], Ordering::Greater).await;
+
+        assert_iter_cmp_eq!([0, 0], [0, 1], Ordering::Less).await;
+        assert_iter_cmp_eq!([0, 0], [0, 0], Ordering::Equal).await;
+        assert_iter_cmp_eq!([0, 1], [0, 0], Ordering::Greater).await;
     }
 }
