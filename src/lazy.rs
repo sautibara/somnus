@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use crate::{
     effect::{
-        Contains, Effect, Exclusivity, Fallibility, FallibilityContains, Fallible, Immutable,
-        Mutable, Pure,
+        self, ApplyExclusivity, Contains, Effect, Exclusivity, Fallibility, FallibilityContains,
+        Fallible, Immutable, Mutable, Pure,
     },
     global::GlobalState,
     module::Module,
@@ -38,14 +38,30 @@ pub struct LazyContext<'a> {
 
 #[doc(hidden)]
 pub struct LazyOutput<E: Effect, T: Send + 'static> {
-    pub(crate) value: <E::Fallibility as Fallibility>::MapOutput<T>,
+    value: effect::Output<T, E>,
 }
 
 impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
+    pub(crate) const fn pure(value: T) -> Self {
+        Self {
+            value: effect::pure::<T, E>(value),
+        }
+    }
+
     pub(crate) fn extract<O: Send + 'static>(self) -> Result<T, LazyOutput<E, O>> {
-        match E::Fallibility::extract(self.value) {
+        match effect::extract::<T, O, E>(self.value) {
             Ok(value) => Ok(value),
             Err(err) => Err(LazyOutput { value: err }),
+        }
+    }
+
+    pub fn into_value(self) -> T
+    where
+        E: Effect<Fallibility: Fallibility<Error = !>>,
+    {
+        match self.value {
+            Ok(value) => value,
+            Err(never) => never,
         }
     }
 
@@ -54,7 +70,16 @@ impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
         E2: Effect<Fallibility: FallibilityContains<E::Fallibility>>,
     {
         LazyOutput {
-            value: E2::Fallibility::map_output(self.value),
+            value: self.value.map_err(Into::into),
+        }
+    }
+
+    pub fn err<Er2: From<!> + Send + 'static>(err: Er2) -> Self
+    where
+        E: Contains<(Fallible<Er2>,)>,
+    {
+        Self {
+            value: effect::error::<T, E, Er2>(err),
         }
     }
 }
@@ -121,16 +146,12 @@ pub trait Lazy<E: Effect>: Sized + Send + 'static {
         map: impl FnOnce(Self::Output) -> T + Send + 'static,
     ) -> impl Lazy<E, Output = T>
     where
-        E: Contains<Pure>,
         T: Send + 'static,
     {
         self.then(|value| Laze::just(map(value)))
     }
 
-    fn discard(self) -> impl Lazy<E, Output = ()>
-    where
-        E: Contains<Pure>,
-    {
+    fn discard(self) -> impl Lazy<E, Output = ()> {
         self.map(|_| ())
     }
 
@@ -225,25 +246,20 @@ impl<O: Send + 'static, E: Effect> Lazy<E> for BoxLazy<E, O> {
 
 pub struct Laze<T, E>(PhantomData<(T, E)>);
 impl<T: Send + 'static, E: Effect> Laze<T, E> {
-    pub fn just(value: T) -> impl Lazy<E, Output = T>
-    where
-        E: Contains<Pure>,
-    {
+    pub fn just(value: T) -> impl Lazy<E, Output = T> {
         struct Just<T>(T);
         impl<T: Send + 'static, E: Effect> Lazy<E> for Just<T> {
             type Output = T;
             fn get(self, _: LazyContext<'_>) -> impl Future<Output = LazyOutput<E, T>> + Send + '_ {
-                std::future::ready(LazyOutput {
-                    value: E::Fallibility::pure(self.0),
-                })
+                std::future::ready(LazyOutput::pure(self.0))
             }
         }
         Just(value)
     }
 
-    pub fn lazy(func: impl FnOnce() -> T + Send + 'static) -> impl Lazy<E, Output = T> {
-        struct Func<F>(F);
-        impl<T, E, F> Lazy<E> for Func<F>
+    pub fn blocking(func: impl FnOnce() -> T + Send + 'static) -> impl Lazy<E, Output = T> {
+        struct Blocking<F>(F);
+        impl<T, E, F> Lazy<E> for Blocking<F>
         where
             T: Send + 'static,
             E: Effect,
@@ -251,18 +267,16 @@ impl<T: Send + 'static, E: Effect> Laze<T, E> {
         {
             type Output = T;
             async fn get(self, _: LazyContext<'_>) -> LazyOutput<E, Self::Output> {
-                LazyOutput {
-                    value: E::Fallibility::pure((self.0)()),
-                }
+                tokio::task::spawn_blocking(self.0)
+                    .map(|res| res.expect("task shouldn't panic"))
+                    .map(LazyOutput::pure)
+                    .await
             }
         }
-        Func(func)
+        Blocking(func)
     }
 
-    pub fn future(fut: impl Future<Output = T> + Send + 'static) -> impl Lazy<E, Output = T>
-    where
-        E: Contains<Pure>,
-    {
+    pub fn future(fut: impl Future<Output = T> + Send + 'static) -> impl Lazy<E, Output = T> {
         struct LazyFuture<F>(F);
         impl<T, F, E> Lazy<E> for LazyFuture<F>
         where
@@ -272,9 +286,7 @@ impl<T: Send + 'static, E: Effect> Laze<T, E> {
         {
             type Output = T;
             fn get(self, _: LazyContext<'_>) -> impl Future<Output = LazyOutput<E, T>> + Send + '_ {
-                self.0.map(|value| LazyOutput {
-                    value: E::Fallibility::pure(value),
-                })
+                self.0.map(LazyOutput::pure)
             }
         }
         LazyFuture(fut)
@@ -301,18 +313,14 @@ impl<T: Send + 'static, E: Effect> Laze<T, E> {
             type Output = T;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, T> {
                 let Some(module) = context.state.modules.get(M::id()) else {
-                    let res = Err(ModuleError::NotFound { id: M::id() });
-                    let value = E::Fallibility::map_output(res);
-                    return LazyOutput { value };
+                    return LazyOutput::err(ModuleError::NotFound { id: M::id() });
                 };
 
                 let module = module.read().await;
                 let value = (self.fut)(&module).await;
                 drop(module);
 
-                LazyOutput {
-                    value: E::Fallibility::pure(value),
-                }
+                LazyOutput::pure(value)
             }
         }
 
@@ -343,18 +351,14 @@ impl<T: Send + 'static, E: Effect> Laze<T, E> {
             type Output = T;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, T> {
                 let Some(module) = context.state.modules.get(M::id()) else {
-                    let res = Err(ModuleError::NotFound { id: M::id() });
-                    let value = E::Fallibility::map_output(res);
-                    return LazyOutput { value };
+                    return LazyOutput::err(ModuleError::NotFound { id: M::id() });
                 };
 
                 let mut module = module.write().await;
                 let value = (self.fut)(&mut module).await;
                 drop(module);
 
-                LazyOutput {
-                    value: E::Fallibility::pure(value),
-                }
+                LazyOutput::pure(value)
             }
         }
 
@@ -393,9 +397,7 @@ pub trait LazyOption<E: Effect>: Lazy<E, Output = Option<Self::Inner>> {
             type Output = Option<T2>;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Option<T2>> {
                 let Some(value) = run_lazy_inner!(self.lazy, context) else {
-                    return LazyOutput {
-                        value: E::Fallibility::pure(None),
-                    };
+                    return LazyOutput::pure(None);
                 };
                 let lazy = (self.then)(value);
                 lazy.get(context).await
@@ -420,7 +422,7 @@ where
 
 pub trait LazyResult<E: Effect>: Lazy<E, Output = Result<Self::Inner, Self::Error>> {
     type Inner: Send + 'static;
-    type Error: Send + 'static;
+    type Error: From<!> + Send + 'static;
 
     fn and_then<T, L>(
         self,
@@ -450,9 +452,7 @@ pub trait LazyResult<E: Effect>: Lazy<E, Output = Result<Self::Inner, Self::Erro
                 let value = match run_lazy_inner!(self.lazy, context) {
                     Ok(value) => value,
                     Err(err) => {
-                        return LazyOutput {
-                            value: E::Fallibility::pure(Err(err)),
-                        };
+                        return LazyOutput::pure(Err(err));
                     }
                 };
                 let lazy = (self.then)(value);
@@ -468,7 +468,7 @@ pub trait LazyResult<E: Effect>: Lazy<E, Output = Result<Self::Inner, Self::Erro
 
     fn throw(self) -> impl Lazy<E, Output = Self::Inner>
     where
-        E: Contains<Fallible<Self::Error>>,
+        E: Contains<(Pure, Fallible<Self::Error>)>,
     {
         struct CancelOnError<L>(L);
 
@@ -476,20 +476,14 @@ pub trait LazyResult<E: Effect>: Lazy<E, Output = Result<Self::Inner, Self::Erro
         where
             L: Lazy<E, Output = Result<T, Err>>,
             T: Send + 'static,
-            E: Contains<Fallible<Err>>,
-            Err: Send + 'static,
+            E: Contains<(Pure, Fallible<Err>)>,
+            Err: From<!> + Send + 'static,
         {
             type Output = T;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Self::Output> {
                 match run_lazy_inner!(self.0, context) {
-                    Ok(value) => LazyOutput {
-                        value: E::Fallibility::pure(value),
-                    },
-                    Err(err) => {
-                        let err = Err(err);
-                        let value = E::Fallibility::map_output(err);
-                        LazyOutput { value }
-                    }
+                    Ok(value) => LazyOutput::pure(value),
+                    Err(err) => LazyOutput::err(err),
                 }
             }
         }
@@ -501,7 +495,7 @@ pub trait LazyResult<E: Effect>: Lazy<E, Output = Result<Self::Inner, Self::Erro
 impl<T, Err, E, L> LazyResult<E> for L
 where
     T: Send + 'static,
-    Err: Send + 'static,
+    Err: From<!> + Send + 'static,
     E: Effect,
     L: Lazy<E, Output = Result<T, Err>>,
 {
@@ -513,10 +507,7 @@ pub trait LazyRecursive<E: Effect>: Lazy<E, Output = Self::InnerLazy> {
     type InnerValue: Send + 'static;
     type InnerLazy: Lazy<E, Output = Self::InnerValue>;
 
-    fn flatten(self) -> impl Lazy<E, Output = Self::InnerValue>
-    where
-        E: Contains<Pure>,
-    {
+    fn flatten(self) -> impl Lazy<E, Output = Self::InnerValue> {
         self.then(|lazy| lazy)
     }
 }
@@ -532,7 +523,9 @@ where
     type InnerLazy = L2;
 }
 
-pub trait LazyFallible<E: Exclusivity, Err: Send + 'static>: Lazy<(E, Fallible<Err>)> {
+pub trait LazyFallible<E: Exclusivity + ApplyExclusivity<Pure>, Err: From<!> + Send + 'static>:
+    Lazy<(E, Fallible<Err>)>
+{
     fn catch<E2>(self) -> impl Lazy<E2, Output = Result<Self::Output, Err>>
     where
         E2: Effect<Exclusivity = E>,
@@ -547,18 +540,14 @@ pub trait LazyFallible<E: Exclusivity, Err: Send + 'static>: Lazy<(E, Fallible<E
             E1: Effect<Fallibility = Fallible<Err>>,
             E2: Effect,
             L: Lazy<E1>,
-            Err: Send + 'static,
+            Err: From<!> + Send + 'static,
         {
             type Output = Result<L::Output, Err>;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E2, Self::Output> {
                 let value = self.lazy.get(context).await;
                 match value.extract() {
-                    Ok(value) => LazyOutput {
-                        value: E2::Fallibility::pure(Ok(value)),
-                    },
-                    Err(err) => LazyOutput {
-                        value: E2::Fallibility::pure(err.value),
-                    },
+                    Ok(value) => LazyOutput::pure(Ok(value)),
+                    Err(err) => LazyOutput::pure(err.value),
                 }
             }
         }
@@ -572,9 +561,9 @@ pub trait LazyFallible<E: Exclusivity, Err: Send + 'static>: Lazy<(E, Fallible<E
 
 impl<E, L, Err> LazyFallible<E, Err> for L
 where
-    E: Exclusivity,
+    E: Exclusivity + ApplyExclusivity<Pure>,
     L: Lazy<(E, Fallible<Err>)>,
-    Err: Send + 'static,
+    Err: From<!> + Send + 'static,
 {
 }
 
@@ -609,7 +598,7 @@ pub trait OptionLazyExt<E: Effect> {
 
 impl<E, L, T> OptionLazyExt<E> for Option<L>
 where
-    E: Contains<Pure>,
+    E: Effect,
     L: Lazy<E, Output = T>,
     T: Send + 'static,
 {
@@ -629,27 +618,33 @@ pub enum ModuleError {
     NotFound { id: &'static NamespacedIdRef },
 }
 
+impl From<!> for ModuleError {
+    fn from(value: !) -> Self {
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
-        effect::{Effect, Fallibility, Fallible, Pure},
+        effect::{self, Effect, Fallible, Pure},
         global::GlobalState,
         lazy::{Laze, Lazy, LazyContext, LazyFallible, LazyResult},
     };
 
     async fn run<E: Effect, L: Lazy<E, Output = T>, T: Send + 'static>(
         lazy: L,
-    ) -> <E::Fallibility as Fallibility>::MapOutput<T> {
+    ) -> effect::CleanOutput<T, E> {
         let state = GlobalState::default();
         let context = LazyContext { state: &state };
 
         let output = lazy.get(context).await;
-        output.value
+        effect::clean::<T, E>(output.value)
     }
 
     macro_rules! assert_lazy_eq {
         ($left:expr, $right:expr) => {
-            assert_lazy_eq!(Pure => ($left, $right))
+            assert_lazy_eq!((Pure,) => ($left, $right))
         };
         ($effect:ty => ($left:expr, $right:expr)) => {
             async {
@@ -665,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn lazy() {
-        assert_lazy_eq!(Laze::lazy(|| 5), 5).await;
+        assert_lazy_eq!(Laze::blocking(|| 5), 5).await;
     }
 
     #[tokio::test]
@@ -689,20 +684,28 @@ mod tests {
         .await;
     }
 
+    #[derive(PartialEq, Eq, Debug)]
+    struct Empty;
+    impl From<!> for Empty {
+        fn from(value: !) -> Self {
+            value
+        }
+    }
+
     #[tokio::test]
     async fn throw() {
-        assert_lazy_eq!(Fallible::<()> => (
-            Laze::just(Err(())).throw(),
-            Result::<(), ()>::Err(())
+        assert_lazy_eq!((Fallible::<Empty>,) => (
+            Laze::just(Err(Empty)).throw(),
+            Result::<(), Empty>::Err(Empty)
         ))
         .await;
     }
 
     #[tokio::test]
     async fn then_fallible() {
-        assert_lazy_eq!(Fallible::<()> => (
-            Laze::just(()).then(|()| Laze::just(Err(())).throw()),
-            Result::<(), ()>::Err(())
+        assert_lazy_eq!((Fallible::<Empty>,) => (
+            Laze::just(()).then(|()| Laze::just(Err(Empty)).throw()),
+            Result::<(), Empty>::Err(Empty)
         ))
         .await;
     }
@@ -710,8 +713,8 @@ mod tests {
     #[tokio::test]
     async fn throw_catch() {
         assert_lazy_eq!(
-            Laze::just(Err(())).throw().catch(),
-            Result::<(), ()>::Err(())
+            Laze::just(Err(Empty)).throw().catch(),
+            Result::<(), Empty>::Err(Empty)
         )
         .await;
     }

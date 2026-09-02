@@ -10,7 +10,7 @@ pub trait LazyFn<E: Effect, Args: Send + 'static>: Sized + Send + 'static {
 
     fn awaken<E2>(&self, args: Args) -> impl Lazy<E2, Output = Self::Output>
     where
-        E2: Contains<E>,
+        E2: Effect + Contains<E>,
     {
         self.call_inner(args).using_effect()
     }

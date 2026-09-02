@@ -7,7 +7,7 @@ use std::{
 use futures::{Stream, StreamExt};
 
 use crate::{
-    effect::{Contains, Effect, Fallibility, Pure},
+    effect::Effect,
     lazy::{Laze, Lazy, LazyOutput, OptionLazyExt},
     run_lazy_inner,
 };
@@ -28,7 +28,6 @@ pub trait LazyIter<E: Effect>:
         map: impl Fn(Self::Item) -> L + Clone + Send + 'static,
     ) -> impl LazyIter<E, Item = T>
     where
-        E: Contains<Pure>,
         L: Lazy<E, Output = T>,
         T: Send + 'static,
     {
@@ -39,7 +38,7 @@ pub trait LazyIter<E: Effect>:
 
         impl<E, I, T, U, L, M> LazyIter<E> for Map<I, M>
         where
-            E: Contains<Pure>,
+            E: Effect,
             I: LazyIter<E, Item = T>,
             T: Send + 'static,
             U: Send + 'static,
@@ -62,7 +61,7 @@ pub trait LazyIter<E: Effect>:
 
         impl<E, I, T, U, L, M> IntoLazyIter<E> for Map<I, M>
         where
-            E: Contains<Pure>,
+            E: Effect,
             I: LazyIter<E, Item = T>,
             T: Send + 'static,
             U: Send + 'static,
@@ -83,16 +82,12 @@ pub trait LazyIter<E: Effect>:
         map: impl Fn(Self::Item) -> T + Clone + Send + 'static,
     ) -> impl LazyIter<E, Item = T>
     where
-        E: Contains<Pure>,
         T: Send + 'static,
     {
         self.map_lazy(move |value| Laze::just(map(value)))
     }
 
-    fn take(self, count: usize) -> impl LazyIter<E, Item = Self::Item>
-    where
-        E: Contains<Pure>,
-    {
+    fn take(self, count: usize) -> impl LazyIter<E, Item = Self::Item> {
         struct Take<I> {
             iter: I,
             count: usize,
@@ -100,7 +95,7 @@ pub trait LazyIter<E: Effect>:
 
         impl<E, I, T> LazyIter<E> for Take<I>
         where
-            E: Contains<Pure>,
+            E: Effect,
             I: LazyIter<E, Item = T>,
             T: Send + 'static,
         {
@@ -131,7 +126,7 @@ pub trait LazyIter<E: Effect>:
 
         impl<E, I, T> IntoLazyIter<E> for Take<I>
         where
-            E: Contains<Pure>,
+            E: Effect,
             I: LazyIter<E, Item = T>,
             T: Send + 'static,
         {
@@ -144,10 +139,7 @@ pub trait LazyIter<E: Effect>:
         Take { iter: self, count }
     }
 
-    fn skip(self, amount: usize) -> impl LazyIter<E, Item = Self::Item>
-    where
-        E: Contains<Pure>,
-    {
+    fn skip(self, amount: usize) -> impl LazyIter<E, Item = Self::Item> {
         struct SkipWhile<I, S> {
             iter: I,
             smuggle: S,
@@ -173,9 +165,7 @@ pub trait LazyIter<E: Effect>:
                     self.iter = iter;
 
                     if self.amount == 0 {
-                        return LazyOutput {
-                            value: E::Fallibility::pure((next, self)),
-                        };
+                        return LazyOutput::pure((next, self));
                     }
 
                     self.amount -= 1;
@@ -225,7 +215,6 @@ pub trait LazyIter<E: Effect>:
 
     fn flatten<T>(self) -> impl LazyIter<E, Item = T>
     where
-        E: Contains<Pure>,
         T: Send + 'static,
         Self::Item: IntoLazyIter<E, IntoItem = T>,
     {
@@ -259,9 +248,7 @@ pub trait LazyIter<E: Effect>:
 
                         // We found a value; we can give it.
                         if value.is_some() {
-                            return LazyOutput {
-                                value: E::Fallibility::pure((value, self)),
-                            };
+                            return LazyOutput::pure((value, self));
                         }
 
                         // We didn't find a value; we have to keep going.
@@ -275,9 +262,7 @@ pub trait LazyIter<E: Effect>:
 
                     // Outer iterator is empty; we're done.
                     let Some(inner_new) = inner_new else {
-                        return LazyOutput {
-                            value: E::Fallibility::pure((None, self)),
-                        };
+                        return LazyOutput::pure((None, self));
                     };
 
                     let inner_new = run_lazy_inner!(inner_new, context);
@@ -340,7 +325,6 @@ pub trait LazyIter<E: Effect>:
 
     fn flat_map<T, I, F>(self, map: F) -> impl LazyIter<E, Item = T>
     where
-        E: Contains<Pure>,
         F: Fn(Self::Item) -> I + Clone + Send + 'static,
         I: IntoLazyIter<E, IntoItem = T>,
         T: Send + 'static,
@@ -350,7 +334,6 @@ pub trait LazyIter<E: Effect>:
 
     fn zip<T, I>(self, iter: I) -> impl LazyIter<E, Item = (Self::Item, T)>
     where
-        E: Contains<Pure>,
         I: IntoLazyIter<E, IntoItem = T>,
         T: Send + 'static,
     {
@@ -361,7 +344,7 @@ pub trait LazyIter<E: Effect>:
 
         impl<E, IL, IR, TL, TR> LazyIter<E> for Zip<IL, IR>
         where
-            E: Contains<Pure>,
+            E: Effect,
             IL: LazyIter<E, Item = TL>,
             IR: LazyIter<E, Item = TR>,
             TL: Send + 'static,
@@ -398,7 +381,7 @@ pub trait LazyIter<E: Effect>:
 
         impl<E, IL, IR, TL, TR> IntoLazyIter<E> for Zip<IL, IR>
         where
-            E: Contains<Pure>,
+            E: Effect,
             IL: LazyIter<E, Item = TL>,
             IR: LazyIter<E, Item = TR>,
             TL: Send + 'static,
@@ -416,16 +399,12 @@ pub trait LazyIter<E: Effect>:
         }
     }
 
-    fn enumerate(self) -> impl LazyIter<E, Item = (usize, Self::Item)>
-    where
-        E: Contains<Pure>,
-    {
+    fn enumerate(self) -> impl LazyIter<E, Item = (usize, Self::Item)> {
         (0..).into_lazy_iter().zip(self)
     }
 
     fn cmp<I>(self, iter: I) -> impl Lazy<E, Output = std::cmp::Ordering>
     where
-        E: Contains<Pure>,
         I: IntoLazyIter<E, IntoItem = Self::Item>,
         Self::Item: Ord,
     {
@@ -436,7 +415,7 @@ pub trait LazyIter<E: Effect>:
 
         impl<E, IL, IR, T> Lazy<E> for Cmp<IL, IR>
         where
-            E: Contains<Pure>,
+            E: Effect,
             IL: LazyIter<E, Item = T>,
             IR: LazyIter<E, Item = T>,
             T: Ord + Send + 'static,
@@ -475,9 +454,7 @@ pub trait LazyIter<E: Effect>:
                         }
                     };
 
-                    return LazyOutput {
-                        value: E::Fallibility::pure(ordering),
-                    };
+                    return LazyOutput::pure(ordering);
                 }
             }
         }
@@ -490,7 +467,6 @@ pub trait LazyIter<E: Effect>:
 
     fn fold_lazy<T, L, F>(self, value: T, mut f: F) -> impl Lazy<E, Output = (T, Self)>
     where
-        E: Contains<Pure>,
         F: FnMut(T, Self::Item) -> L + Send + 'static,
         L: Lazy<E, Output = T>,
         T: Send + 'static,
@@ -506,7 +482,6 @@ pub trait LazyIter<E: Effect>:
 
     fn fold<T, F>(self, value: T, mut f: F) -> impl Lazy<E, Output = (T, Self)>
     where
-        E: Contains<Pure>,
         F: FnMut(T, Self::Item) -> T + Send + 'static,
         T: Send + 'static,
     {
@@ -515,7 +490,6 @@ pub trait LazyIter<E: Effect>:
 
     fn for_each_lazy<L, F>(self, mut f: F) -> impl Lazy<E, Output = Self>
     where
-        E: Contains<Pure>,
         F: FnMut(Self::Item) -> L + Send + 'static,
         L: Lazy<E, Output = ()>,
     {
@@ -525,7 +499,6 @@ pub trait LazyIter<E: Effect>:
 
     fn for_each<F>(self, mut f: F) -> impl Lazy<E, Output = Self>
     where
-        E: Contains<Pure>,
         F: FnMut(Self::Item) + Send + 'static,
     {
         self.for_each_lazy(move |item| {
@@ -540,7 +513,6 @@ pub trait LazyIter<E: Effect>:
         f: F,
     ) -> impl Lazy<E, Output = (Result<T, Er>, Self)>
     where
-        E: Contains<Pure>,
         T: Send + 'static,
         Er: Send + 'static,
         F: FnMut(T, Self::Item) -> L + Send + 'static,
@@ -585,16 +557,12 @@ pub trait LazyIter<E: Effect>:
                     match run_lazy_inner!(func(value, t), context) {
                         Ok(new_value) => value = new_value,
                         Err(err) => {
-                            return LazyOutput {
-                                value: E::Fallibility::pure((Err(err), iter)),
-                            };
+                            return LazyOutput::pure((Err(err), iter));
                         }
                     }
                 }
 
-                LazyOutput {
-                    value: E::Fallibility::pure((Ok(value), iter)),
-                }
+                LazyOutput::pure((Ok(value), iter))
             }
         }
 
@@ -607,7 +575,6 @@ pub trait LazyIter<E: Effect>:
 
     fn try_fold<T, Er, F>(self, value: T, mut f: F) -> impl Lazy<E, Output = (Result<T, Er>, Self)>
     where
-        E: Contains<Pure>,
         F: FnMut(T, Self::Item) -> Result<T, Er> + Send + 'static,
         T: Send + 'static,
         Er: Send + 'static,
@@ -617,7 +584,6 @@ pub trait LazyIter<E: Effect>:
 
     fn collect<I>(self) -> impl Lazy<E, Output = I>
     where
-        E: Contains<Pure>,
         I: FromLazyIter<E, Self::Item>,
     {
         I::from_lazy_iter(self).map(|(collection, _)| collection)
@@ -629,15 +595,12 @@ impl<E: Effect, T: Send + 'static> LazeIter<E, T> {
     #[expect(clippy::should_implement_trait)] // can't implement it yet :(
     pub fn from_iter(
         iter: impl IntoIterator<Item = T, IntoIter: Send + 'static>,
-    ) -> impl LazyIter<E, Item = T>
-    where
-        E: Contains<Pure>,
-    {
+    ) -> impl LazyIter<E, Item = T> {
         struct FromIter<I>(I);
 
         impl<E, T, I> LazyIter<E> for FromIter<I>
         where
-            E: Contains<Pure>,
+            E: Effect,
             T: Send + 'static,
             I: Iterator<Item = T> + Send + 'static,
         {
@@ -657,7 +620,7 @@ impl<E: Effect, T: Send + 'static> LazeIter<E, T> {
 
         impl<E, T, I> IntoLazyIter<E> for FromIter<I>
         where
-            E: Contains<Pure>,
+            E: Effect,
             T: Send + 'static,
             I: Iterator<Item = T> + Send + 'static,
         {
@@ -672,14 +635,11 @@ impl<E: Effect, T: Send + 'static> LazeIter<E, T> {
 
     pub fn from_stream(
         stream: impl Stream<Item = T> + Unpin + Send + 'static,
-    ) -> impl LazyIter<E, Item = T>
-    where
-        E: Contains<Pure>,
-    {
+    ) -> impl LazyIter<E, Item = T> {
         struct FromStream<S>(S);
         impl<E, T, S> LazyIter<E> for FromStream<S>
         where
-            E: Contains<Pure>,
+            E: Effect,
             T: Send + 'static,
             S: Stream<Item = T> + Unpin + Send + 'static,
         {
@@ -701,7 +661,7 @@ impl<E: Effect, T: Send + 'static> LazeIter<E, T> {
 
         impl<E, T, S> IntoLazyIter<E> for FromStream<S>
         where
-            E: Contains<Pure>,
+            E: Effect,
             T: Send + 'static,
             S: Stream<Item = T> + Unpin + Send + 'static,
         {
@@ -720,14 +680,14 @@ pub trait IntoLazyIter<E: Effect>: Send + 'static {
     fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem>;
 }
 
-impl<E: Contains<Pure>, T: Send + 'static> IntoLazyIter<E> for Vec<T> {
+impl<E: Effect, T: Send + 'static> IntoLazyIter<E> for Vec<T> {
     type IntoItem = T;
     fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
         LazeIter::from_iter(self)
     }
 }
 
-impl<E: Contains<Pure>, T: Send + 'static, const LEN: usize> IntoLazyIter<E> for [T; LEN] {
+impl<E: Effect, T: Send + 'static, const LEN: usize> IntoLazyIter<E> for [T; LEN] {
     type IntoItem = T;
     fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
         LazeIter::from_iter(self)
@@ -736,7 +696,7 @@ impl<E: Contains<Pure>, T: Send + 'static, const LEN: usize> IntoLazyIter<E> for
 
 impl<E, K, V, S> IntoLazyIter<E> for HashMap<K, V, S>
 where
-    E: Contains<Pure>,
+    E: Effect,
     K: Send + 'static,
     V: Send + 'static,
     S: Send + 'static,
@@ -749,7 +709,7 @@ where
 
 impl<E, T> IntoLazyIter<E> for std::ops::Range<T>
 where
-    E: Contains<Pure>,
+    E: Effect,
     T: Send + 'static,
     Self: Iterator<Item = T>,
 {
@@ -761,7 +721,7 @@ where
 
 impl<E, T> IntoLazyIter<E> for std::ops::RangeFrom<T>
 where
-    E: Contains<Pure>,
+    E: Effect,
     T: Send + 'static,
     Self: Iterator<Item = T>,
 {
@@ -773,7 +733,7 @@ where
 
 impl<E, T> IntoLazyIter<E> for std::ops::RangeInclusive<T>
 where
-    E: Contains<Pure>,
+    E: Effect,
     T: Send + 'static,
     Self: Iterator<Item = T>,
 {
@@ -789,7 +749,7 @@ pub trait FromLazyIter<E: Effect, T: Send + 'static>: Sized + Send + 'static {
         I: LazyIter<E, Item = T>;
 }
 
-impl<E: Contains<Pure>, T: Send + 'static> FromLazyIter<E, T> for Vec<T> {
+impl<E: Effect, T: Send + 'static> FromLazyIter<E, T> for Vec<T> {
     fn from_lazy_iter<I>(iter: I) -> impl Lazy<E, Output = (Self, I)>
     where
         I: LazyIter<E, Item = T>,
@@ -805,7 +765,7 @@ impl<E: Contains<Pure>, T: Send + 'static> FromLazyIter<E, T> for Vec<T> {
 
 impl<E, K, V, S> FromLazyIter<E, (K, V)> for HashMap<K, V, S>
 where
-    E: Contains<Pure>,
+    E: Effect,
     K: Eq + Hash + Send + 'static,
     V: Send + 'static,
     S: BuildHasher + Default + Send + 'static,
@@ -825,7 +785,7 @@ where
 
 impl<E, C, T, Err> FromLazyIter<E, Result<T, Err>> for Result<C, Err>
 where
-    E: Contains<Pure>,
+    E: Effect,
     C: FromLazyIter<E, T>,
     T: Send + 'static,
     Err: Send + 'static,
@@ -841,7 +801,7 @@ where
 
         impl<E, I, T, Err> LazyIter<E> for Shunt<I, Err>
         where
-            E: Contains<Pure>,
+            E: Effect,
             I: LazyIter<E, Item = Result<T, Err>>,
             T: Send + 'static,
             Err: Send + 'static,
@@ -875,7 +835,7 @@ where
 
         impl<E, I, T, Err> IntoLazyIter<E> for Shunt<I, Err>
         where
-            E: Contains<Pure>,
+            E: Effect,
             I: LazyIter<E, Item = Result<T, Err>>,
             T: Send + 'static,
             Err: Send + 'static,
@@ -901,18 +861,15 @@ mod tests {
     use std::cmp::Ordering;
 
     use crate::{
-        effect::{Contains, Fallibility, Pure},
+        effect::{Contains, Effect, Infallible, Pure},
         global::GlobalState,
         iter::{IntoLazyIter, LazyIter},
         lazy::{Lazy, LazyContext},
     };
 
-    async fn cmp<E, IL, IR, T>(
-        left: IL,
-        right: IR,
-    ) -> <E::Fallibility as Fallibility>::MapOutput<std::cmp::Ordering>
+    async fn cmp<E, IL, IR, T>(left: IL, right: IR) -> std::cmp::Ordering
     where
-        E: Contains<Pure>,
+        E: Effect<Fallibility = Infallible>,
         IL: IntoLazyIter<E, IntoItem = T>,
         IR: IntoLazyIter<E, IntoItem = T>,
         T: Ord + Send + 'static,
@@ -923,12 +880,12 @@ mod tests {
         let ordering = IntoLazyIter::<E>::into_lazy_iter(left).cmp(right);
         let ordering = ordering.get(context).await;
 
-        ordering.value
+        ordering.into_value()
     }
 
     macro_rules! assert_iter_cmp_eq {
         ($left:expr, $right:expr, $cmp:expr) => {
-            assert_iter_cmp_eq!(Pure => ($left, $right, $cmp))
+            assert_iter_cmp_eq!((Pure,) => ($left, $right, $cmp))
         };
         ($effect:ty => ($left:expr, $right:expr, $cmp:expr)) => {
             async {
