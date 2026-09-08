@@ -1,7 +1,9 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     hash::{BuildHasher, Hash},
     marker::PhantomData,
+    ops::ControlFlow,
 };
 
 use futures::{Stream, StreamExt};
@@ -403,66 +405,35 @@ pub trait LazyIter<E: Effect>:
         (0..).into_lazy_iter().zip(self)
     }
 
-    fn cmp<I>(self, iter: I) -> impl Lazy<E, Output = std::cmp::Ordering>
+    fn cmp<I>(self, iter: I) -> impl Lazy<E, Output = Ordering>
     where
         I: IntoLazyIter<E, IntoItem = Self::Item>,
         Self::Item: Ord,
     {
-        struct Cmp<IL, IR> {
-            left: IL,
-            right: IR,
-        }
+        Laze::looping((self, iter.into_lazy_iter()), |(left, right)| {
+            left.next()
+                .then(move |rets| right.next().attach(rets))
+                .then(move |((left_next, left), (right_next, right))| {
+                    let ret = |ordering| Laze::just(ControlFlow::Break(ordering)).left();
 
-        impl<E, IL, IR, T> Lazy<E> for Cmp<IL, IR>
-        where
-            E: Effect,
-            IL: LazyIter<E, Item = T>,
-            IR: LazyIter<E, Item = T>,
-            T: Ord + Send + 'static,
-        {
-            type Output = std::cmp::Ordering;
-
-            async fn get(
-                self,
-                context: crate::lazy::LazyContext<'_>,
-            ) -> LazyOutput<E, Self::Output> {
-                let Self {
-                    mut left,
-                    mut right,
-                } = self;
-
-                loop {
-                    let (left_next, left_new) = run_lazy_inner!(left.next(), context);
-                    left = left_new;
-
-                    let (right_next, right_new) = run_lazy_inner!(right.next(), context);
-                    right = right_new;
-
-                    let ordering = match (left_next, right_next) {
-                        (None, None) => std::cmp::Ordering::Equal,
-                        (Some(_), None) => std::cmp::Ordering::Greater,
-                        (None, Some(_)) => std::cmp::Ordering::Less,
-                        (Some(left_next), Some(right_next)) => {
-                            let left_next = run_lazy_inner!(left_next, context);
-                            let right_next = run_lazy_inner!(right_next, context);
-
-                            let ordering = left_next.cmp(&right_next);
-                            if ordering.is_eq() {
-                                continue;
-                            }
-                            ordering
-                        }
-                    };
-
-                    return LazyOutput::pure(ordering);
-                }
-            }
-        }
-
-        Cmp {
-            left: self,
-            right: iter.into_lazy_iter(),
-        }
+                    match (left_next, right_next) {
+                        (None, None) => ret(Ordering::Equal),
+                        (Some(_), None) => ret(Ordering::Greater),
+                        (None, Some(_)) => ret(Ordering::Less),
+                        (Some(left_next), Some(right_next)) => left_next
+                            .then(move |rets| right_next.attach(rets))
+                            .map(move |(left_next, right_next)| {
+                                let ordering = left_next.cmp(&right_next);
+                                if ordering.is_eq() {
+                                    ControlFlow::Continue((left, right))
+                                } else {
+                                    ControlFlow::Break(ordering)
+                                }
+                            })
+                            .right(),
+                    }
+                })
+        })
     }
 
     fn fold_lazy<T, L, F>(self, value: T, mut f: F) -> impl Lazy<E, Output = (T, Self)>
@@ -861,7 +832,7 @@ mod tests {
     use std::cmp::Ordering;
 
     use crate::{
-        effect::{Contains, Effect, Infallible, Pure},
+        effect::{Effect, Infallible, Pure, Unbreakable},
         global::GlobalState,
         iter::{IntoLazyIter, LazyIter},
         lazy::{Lazy, LazyContext},
@@ -869,7 +840,7 @@ mod tests {
 
     async fn cmp<E, IL, IR, T>(left: IL, right: IR) -> std::cmp::Ordering
     where
-        E: Effect<Fallibility = Infallible>,
+        E: Effect<Fallibility = Infallible, Breakability = Unbreakable>,
         IL: IntoLazyIter<E, IntoItem = T>,
         IR: IntoLazyIter<E, IntoItem = T>,
         T: Ord + Send + 'static,

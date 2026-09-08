@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, ops::ControlFlow};
 
 use auditeur::namespaced_id::NamespacedIdRef;
 use futures::{FutureExt, future::BoxFuture};
@@ -6,8 +6,9 @@ use thiserror::Error;
 
 use crate::{
     effect::{
-        self, ApplyExclusivity, Contains, Effect, Exclusivity, Fallibility, FallibilityContains,
-        Fallible, Immutable, Mutable, Pure,
+        self, Apply, BreakOut, Breakability, BreakabilityContains, Breakable, Contains, Effect,
+        Fallibility, FallibilityContains, Fallible, Immutable, Infallible, MakeBreak, MakePartial,
+        Mutable, Partial, Pure, Unbreakable,
     },
     global::GlobalState,
     module::Module,
@@ -42,7 +43,7 @@ pub struct LazyOutput<E: Effect, T: Send + 'static> {
 }
 
 impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
-    pub(crate) const fn pure(value: T) -> Self {
+    pub(crate) fn pure(value: T) -> Self {
         Self {
             value: effect::pure::<T, E>(value),
         }
@@ -57,7 +58,7 @@ impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
 
     pub fn into_value(self) -> T
     where
-        E: Effect<Fallibility: Fallibility<Error = !>>,
+        E: Effect<Fallibility: Fallibility<Error = !>, Breakability = Unbreakable>,
     {
         match self.value {
             Ok(value) => value,
@@ -67,10 +68,13 @@ impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
 
     fn with_effect<E2>(self) -> LazyOutput<E2, T>
     where
-        E2: Effect<Fallibility: FallibilityContains<E::Fallibility>>,
+        E2: Effect<
+                Fallibility: FallibilityContains<E::Fallibility>,
+                Breakability: BreakabilityContains<E::Breakability>,
+            >,
     {
         LazyOutput {
-            value: self.value.map_err(Into::into),
+            value: self.value.map(E2::Breakability::map).map_err(Into::into),
         }
     }
 
@@ -80,6 +84,22 @@ impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
     {
         Self {
             value: effect::error::<T, E, Er2>(err),
+        }
+    }
+
+    pub const fn breaking(breaking: <E::Breakability as Breakability>::Wrap<T>) -> Self {
+        Self {
+            value: Ok(breaking),
+        }
+    }
+
+    pub fn break_out<B>(value: B) -> Self
+    where
+        B: Send + 'static,
+        E::Breakability: BreakOut<Outer = B>,
+    {
+        Self {
+            value: Ok(E::Breakability::break_out(value)),
         }
     }
 }
@@ -188,7 +208,10 @@ pub trait Lazy<E: Effect>: Sized + Send + 'static {
 
     fn overwrite_exclusivity<E2>(self) -> impl Lazy<E2, Output = Self::Output>
     where
-        E2: Effect<Fallibility: FallibilityContains<E::Fallibility>>,
+        E2: Effect<
+                Fallibility: FallibilityContains<E::Fallibility>,
+                Breakability: BreakabilityContains<E::Breakability>,
+            >,
     {
         struct AssertEffect<E1, L> {
             lazy: L,
@@ -198,7 +221,10 @@ pub trait Lazy<E: Effect>: Sized + Send + 'static {
         impl<E1, E2, L> Lazy<E2> for AssertEffect<E1, L>
         where
             E1: Effect,
-            E2: Effect<Fallibility: FallibilityContains<E1::Fallibility>>,
+            E2: Effect<
+                    Fallibility: FallibilityContains<E1::Fallibility>,
+                    Breakability: BreakabilityContains<E1::Breakability>,
+                >,
             L: Lazy<E1>,
         {
             type Output = L::Output;
@@ -222,6 +248,10 @@ pub trait Lazy<E: Effect>: Sized + Send + 'static {
 
     fn right<L>(self) -> Either<L, Self> {
         Either::Right(self)
+    }
+
+    fn attach<T: Send + 'static>(self, value: T) -> impl Lazy<E, Output = (T, Self::Output)> {
+        self.map(|out| (value, out))
     }
 }
 
@@ -290,6 +320,10 @@ impl<T: Send + 'static, E: Effect> Laze<T, E> {
             }
         }
         LazyFuture(fut)
+    }
+
+    pub fn todo() -> impl Lazy<E, Output = T> {
+        Self::future(async { todo!() })
     }
 
     pub fn with<M: Module>(
@@ -366,6 +400,121 @@ impl<T: Send + 'static, E: Effect> Laze<T, E> {
             fut,
             pd: PhantomData,
         }
+    }
+
+    pub fn looping<F, L, C>(initial: C, func: F) -> impl Lazy<E, Output = T>
+    where
+        F: FnMut(C) -> L + Send + 'static,
+        L: Lazy<E, Output = ControlFlow<T, C>>,
+        C: Send + 'static,
+    {
+        struct Looping<F, C> {
+            func: F,
+            value: C,
+        }
+
+        impl<E, F, L, C, T> Lazy<E> for Looping<F, C>
+        where
+            E: Effect,
+            F: FnMut(C) -> L + Send + 'static,
+            L: Lazy<E, Output = ControlFlow<T, C>>,
+            C: Send + 'static,
+            T: Send + 'static,
+        {
+            type Output = T;
+
+            async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Self::Output> {
+                let Self {
+                    mut func,
+                    mut value,
+                } = self;
+
+                let result = loop {
+                    let flow = run_lazy_inner!(func(value), context);
+                    match flow {
+                        ControlFlow::Continue(new_value) => value = new_value,
+                        ControlFlow::Break(result) => break result,
+                    }
+                };
+
+                LazyOutput::pure(result)
+            }
+        }
+
+        Looping {
+            func,
+            value: initial,
+        }
+    }
+
+    pub fn breaking<F, L>(func: F) -> impl Lazy<E, Output = T>
+    where
+        E: MakeBreak<T>,
+        F: FnOnce(fn(T) -> Break<T, E>) -> L + Send + 'static,
+        L: Lazy<<E as MakeBreak<T>>::Make, Output = T>,
+    {
+        struct Breaking<F, PD> {
+            func: F,
+            pd: PhantomData<PD>,
+        }
+
+        impl<E, F, L, T> Lazy<E> for Breaking<F, (L, T)>
+        where
+            E: MakeBreak<T>,
+            F: FnOnce(fn(T) -> Break<T, E>) -> L + Send + 'static,
+            L: Lazy<<E as MakeBreak<T>>::Make, Output = T>,
+            T: Send + 'static,
+        {
+            type Output = T;
+
+            async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Self::Output> {
+                let lazy = (self.func)(Break::new);
+                let output = lazy.get(context).await;
+
+                match output.value {
+                    Ok(value) => {
+                        match <<E as MakeBreak<T>>::Make as Effect>::Breakability::catch(value) {
+                            ControlFlow::Continue(value) => LazyOutput::breaking(value),
+                            ControlFlow::Break(value) => LazyOutput::pure(value),
+                        }
+                    }
+                    Err(err) => LazyOutput::err(err),
+                }
+            }
+        }
+
+        Breaking {
+            func,
+            pd: PhantomData,
+        }
+    }
+}
+
+pub struct Break<T, E> {
+    value: T,
+    pd: PhantomData<E>,
+}
+
+impl<T, E> Break<T, E> {
+    const fn new(value: T) -> Self {
+        Self {
+            value,
+            pd: PhantomData,
+        }
+    }
+}
+
+impl<T, E, E2> Lazy<E2> for Break<T, E>
+where
+    T: Send + 'static,
+    E: Effect + MakePartial + Apply<<Breakable<T> as Partial>::Use>,
+    (E::Partial, Breakable<T>): Effect<Breakability: BreakOut<Outer = T>>,
+    E2: Contains<(E::Partial, Breakable<T>)>,
+{
+    type Output = !;
+
+    async fn get(self, _: LazyContext<'_>) -> LazyOutput<E2, Self::Output> {
+        LazyOutput::<(E::Partial, Breakable<T>), _>::break_out(self.value).with_effect()
     }
 }
 
@@ -523,31 +672,33 @@ where
     type InnerLazy = L2;
 }
 
-pub trait LazyFallible<E: Exclusivity + ApplyExclusivity<Pure>, Err: From<!> + Send + 'static>:
-    Lazy<(E, Fallible<Err>)>
+pub trait LazyFallible<E: Effect<Fallibility = Infallible>, Err: From<!> + Send + 'static>:
+    Lazy<(E::Exclusivity, E::Breakability, Fallible<Err>)>
+where
+    (E::Exclusivity, E::Breakability, Fallible<Err>):
+        Effect<Breakability = E::Breakability, Fallibility = Fallible<Err>>,
 {
-    fn catch<E2>(self) -> impl Lazy<E2, Output = Result<Self::Output, Err>>
-    where
-        E2: Effect<Exclusivity = E>,
-    {
-        struct Catch<E1, L> {
+    fn catch(self) -> impl Lazy<E, Output = Result<Self::Output, Err>> {
+        struct Catch<L, E> {
             lazy: L,
-            pd: PhantomData<E1>,
+            pd: PhantomData<E>,
         }
 
-        impl<E1, E2, L, Err> Lazy<E2> for Catch<E1, L>
+        impl<E, Err, L> Lazy<E> for Catch<L, Err>
         where
-            E1: Effect<Fallibility = Fallible<Err>>,
-            E2: Effect,
-            L: Lazy<E1>,
+            E: Effect<Fallibility = Infallible>,
             Err: From<!> + Send + 'static,
+            (E::Exclusivity, E::Breakability, Fallible<Err>):
+                Effect<Breakability = E::Breakability, Fallibility = Fallible<Err>>,
+            L: Lazy<(E::Exclusivity, E::Breakability, Fallible<Err>)>,
         {
             type Output = Result<L::Output, Err>;
-            async fn get(self, context: LazyContext<'_>) -> LazyOutput<E2, Self::Output> {
+            async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Self::Output> {
                 let value = self.lazy.get(context).await;
-                match value.extract() {
+                match value.extract().map_err(|err| err.value) {
                     Ok(value) => LazyOutput::pure(Ok(value)),
-                    Err(err) => LazyOutput::pure(err.value),
+                    Err(Ok(breaking)) => LazyOutput::breaking(breaking),
+                    Err(Err(error)) => LazyOutput::pure(Err(error)),
                 }
             }
         }
@@ -561,9 +712,11 @@ pub trait LazyFallible<E: Exclusivity + ApplyExclusivity<Pure>, Err: From<!> + S
 
 impl<E, L, Err> LazyFallible<E, Err> for L
 where
-    E: Exclusivity + ApplyExclusivity<Pure>,
-    L: Lazy<(E, Fallible<Err>)>,
+    E: Effect<Fallibility = Infallible>,
     Err: From<!> + Send + 'static,
+    L: Lazy<(E::Exclusivity, E::Breakability, Fallible<Err>)>,
+    (E::Exclusivity, E::Breakability, Fallible<Err>):
+        Effect<Breakability = E::Breakability, Fallibility = Fallible<Err>>,
 {
 }
 
@@ -722,5 +875,10 @@ mod tests {
     #[tokio::test]
     async fn boxed() {
         assert_lazy_eq!(Laze::just(5).boxed(), 5).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_break() {
+        assert_lazy_eq!(Laze::breaking(|break_with| break_with(5).map(|n| n)), 5).await;
     }
 }
