@@ -411,28 +411,29 @@ pub trait LazyIter<E: Effect>:
         Self::Item: Ord,
     {
         Laze::looping((self, iter.into_lazy_iter()), |(left, right)| {
-            left.next()
-                .then(move |rets| right.next().attach(rets))
-                .then(move |((left_next, left), (right_next, right))| {
+            Laze::collect((left.next(), right.next())).then(
+                move |((left_next, left), (right_next, right))| {
                     let ret = |ordering| Laze::just(ControlFlow::Break(ordering)).left();
 
                     match (left_next, right_next) {
                         (None, None) => ret(Ordering::Equal),
                         (Some(_), None) => ret(Ordering::Greater),
                         (None, Some(_)) => ret(Ordering::Less),
-                        (Some(left_next), Some(right_next)) => left_next
-                            .then(move |rets| right_next.attach(rets))
-                            .map(move |(left_next, right_next)| {
-                                let ordering = left_next.cmp(&right_next);
-                                if ordering.is_eq() {
-                                    ControlFlow::Continue((left, right))
-                                } else {
-                                    ControlFlow::Break(ordering)
-                                }
-                            })
-                            .right(),
+                        (Some(left_next), Some(right_next)) => {
+                            Laze::collect((left_next, right_next))
+                                .map(move |(left_next, right_next)| {
+                                    let ordering = left_next.cmp(&right_next);
+                                    if ordering.is_eq() {
+                                        ControlFlow::Continue((left, right))
+                                    } else {
+                                        ControlFlow::Break(ordering)
+                                    }
+                                })
+                                .right()
+                        }
                     }
-                })
+                },
+            )
         })
     }
 

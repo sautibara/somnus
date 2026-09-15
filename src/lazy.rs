@@ -490,6 +490,10 @@ impl<T: Send + 'static, E: Effect> Laze<T, E> {
             pd: PhantomData,
         }
     }
+
+    pub fn collect<L: LazyCollect<E, Output = T>>(tuple: L) -> impl Lazy<E, Output = T> {
+        tuple.collect()
+    }
 }
 
 pub struct Break<T, E> {
@@ -519,6 +523,55 @@ where
         LazyOutput::<(E::Partial, Breakable<T>), _>::break_out(self.value).with_effect()
     }
 }
+
+/// Tuples containing [`Lazy`] values, as used in [`Laze::collect`].
+pub trait LazyCollect<E: Effect> {
+    type Output: Send + 'static;
+
+    fn collect(self) -> impl Lazy<E, Output = Self::Output>;
+}
+
+macro_rules! impl_lazy_collect {
+    ($(($L:ident, $l:ident, $v:ident)),*) => {
+        impl<E: Effect, $($L,)*> LazyCollect<E> for ($($L,)*)
+        where
+            $($L: Lazy<E>,)*
+        {
+            type Output = ($($L::Output,)*);
+
+            fn collect(self) -> impl Lazy<E, Output = Self::Output> {
+                let ($($l,)*) = self;
+                impl_lazy_collect!(@ () () $(($l, $v))*)
+            }
+        }
+    };
+    (@ () ()) => {
+        Laze::just(())
+    };
+    (@ () () ($l:ident, $v:ident) $($rest:tt)*) => {
+        impl_lazy_collect!(@
+            ($l.map(move |$v| ($v,)))
+            ($v)
+            $($rest)*
+        )
+    };
+    (@ ($run:expr) ($($prev:tt)*) ($l:ident, $v:ident) $($rest:tt)*) => {
+        impl_lazy_collect!(@
+            (
+                $run.then(move |($($prev)*,)|
+                    $l.map(move |$v| ($($prev)*, $v,))
+                )
+            )
+            ($($prev)*, $v)
+            $($rest)*
+        )
+    };
+    (@ ($run:expr) ($($prev:tt)*)) => {
+        $run
+    };
+}
+
+bevy_utils_proc_macros::all_tuples!(impl_lazy_collect, 0, 15, L, l, v);
 
 pub trait LazyOption<E: Effect>: Lazy<E, Output = Option<Self::Inner>> {
     type Inner: Send + 'static;
