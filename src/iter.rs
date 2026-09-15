@@ -220,67 +220,16 @@ pub trait LazyIter<E: Effect>:
         T: Send + 'static,
         Self::Item: IntoLazyIter<E, IntoItem = T>,
     {
-        struct Flatten<I, In, F> {
+        struct Flatten<I, In> {
             iter: I,
             inner: Option<In>,
-            smuggle: F,
         }
 
-        impl<E, I, In, F, FL, L, T> Lazy<E> for Flatten<I, In, F>
+        impl<E, I, In, T> LazyIter<E> for Flatten<I, In>
         where
             E: Effect,
             I: LazyIter<E, Item = In>,
             In: LazyIter<E, Item = T>,
-            F: Fn(In) -> FL + Send + 'static,
-            FL: Lazy<E, Output = (Option<L>, In)>,
-            L: Lazy<E, Output = T>,
-            T: Send + 'static,
-        {
-            type Output = (Option<L>, Self);
-            async fn get(
-                mut self,
-                context: crate::lazy::LazyContext<'_>,
-            ) -> crate::lazy::LazyOutput<E, Self::Output> {
-                loop {
-                    // We already have an inner iterator:
-                    if let Some(inner_inner) = self.inner {
-                        let lazy = (self.smuggle)(inner_inner);
-                        let (value, inner_new) = run_lazy_inner!(lazy, context);
-                        self.inner = Some(inner_new);
-
-                        // We found a value; we can give it.
-                        if value.is_some() {
-                            return LazyOutput::pure((value, self));
-                        }
-
-                        // We didn't find a value; we have to keep going.
-                        self.inner = None;
-                    }
-
-                    // We need a new inner iterator:
-                    let lazy = self.iter.next();
-                    let (inner_new, iter_new) = run_lazy_inner!(lazy, context);
-                    self.iter = iter_new;
-
-                    // Outer iterator is empty; we're done.
-                    let Some(inner_new) = inner_new else {
-                        return LazyOutput::pure((None, self));
-                    };
-
-                    let inner_new = run_lazy_inner!(inner_new, context);
-                    self.inner = Some(inner_new);
-                }
-            }
-        }
-
-        impl<E, I, In, F, FL, L, T> LazyIter<E> for Flatten<I, In, F>
-        where
-            E: Effect,
-            I: LazyIter<E, Item = In>,
-            In: LazyIter<E, Item = T>,
-            F: Fn(In) -> FL + Send + 'static,
-            FL: Lazy<E, Output = (Option<L>, In)>,
-            L: Lazy<E, Output = T>,
             T: Send + 'static,
         {
             type Item = T;
@@ -288,18 +237,48 @@ pub trait LazyIter<E: Effect>:
                 self,
             ) -> impl Lazy<E, Output = (Option<impl Lazy<E, Output = Self::Item>>, Self)>
             {
-                self
+                let Self { iter, inner } = self;
+                Laze::looping((iter, inner), |(iter, inner)| {
+                    if let Some(inner) = inner {
+                        inner
+                            .next()
+                            .map(|(next, inner)| {
+                                // We got a value, return it.
+                                if next.is_some() {
+                                    let inner = Some(inner);
+                                    return ControlFlow::Break((next, Self { iter, inner }));
+                                }
+
+                                // The inner iterator ended, get a new one.
+                                ControlFlow::Continue((iter, None))
+                            })
+                            .left()
+                    } else {
+                        iter.next()
+                            .then(|(inner, iter)| {
+                                // We're out of inner iterators, return None.
+                                let Some(inner) = inner else {
+                                    let flow =
+                                        ControlFlow::Break((None, Self { iter, inner: None }));
+                                    return Laze::just(flow).left();
+                                };
+
+                                // We got a new inner iterator, check it.
+                                inner
+                                    .map(move |inner| ControlFlow::Continue((iter, Some(inner))))
+                                    .right()
+                            })
+                            .right()
+                    }
+                })
             }
         }
 
-        impl<E, I, In, F, FL, L, T> IntoLazyIter<E> for Flatten<I, In, F>
+        impl<E, I, In, T> IntoLazyIter<E> for Flatten<I, In>
         where
             E: Effect,
             I: LazyIter<E, Item = In>,
             In: LazyIter<E, Item = T>,
-            F: Fn(In) -> FL + Send + 'static,
-            FL: Lazy<E, Output = (Option<L>, In)>,
-            L: Lazy<E, Output = T>,
             T: Send + 'static,
         {
             type IntoItem = T;
@@ -315,11 +294,7 @@ pub trait LazyIter<E: Effect>:
             I: LazyIter<E, Item = In>,
             In: LazyIter<E, Item = T>,
         {
-            Flatten {
-                iter,
-                inner: None,
-                smuggle: |inner: In| inner.next(),
-            }
+            Flatten { iter, inner: None }
         }
 
         flatten(self.map(IntoLazyIter::into_lazy_iter))
@@ -444,12 +419,9 @@ pub trait LazyIter<E: Effect>:
         T: Send + 'static,
     {
         self.try_fold_lazy(value, move |acc, value| {
-            f(acc, value).map(|value| Result::<_, std::convert::Infallible>::Ok(value))
+            f(acc, value).map(|value| Result::<_, !>::Ok(value))
         })
-        .map(|(res, this)| match res {
-            Ok(value) => (value, this),
-            Err(_) => unreachable!(),
-        })
+        .map(|(Ok(value), this)| (value, this))
     }
 
     fn fold<T, F>(self, value: T, mut f: F) -> impl Lazy<E, Output = (T, Self)>
@@ -490,59 +462,20 @@ pub trait LazyIter<E: Effect>:
         F: FnMut(T, Self::Item) -> L + Send + 'static,
         L: Lazy<E, Output = Result<T, Er>>,
     {
-        struct Fold<I, F, U> {
-            iter: I,
-            func: F,
-            value: U,
-        }
+        Laze::looping((value, f, self), |(value, mut f, iter)| {
+            iter.next().then(move |(next, iter)| {
+                let Some(next) = next else {
+                    return Laze::just(ControlFlow::Break((Ok(value), iter))).left();
+                };
 
-        impl<E, I, F, L, T, U, Er> Lazy<E> for Fold<I, F, U>
-        where
-            E: Effect,
-            I: LazyIter<E, Item = T>,
-            F: FnMut(U, T) -> L + Send + 'static,
-            L: Lazy<E, Output = Result<U, Er>>,
-            T: Send + 'static,
-            U: Send + 'static,
-            Er: Send + 'static,
-        {
-            type Output = (Result<U, Er>, I);
-            async fn get(
-                self,
-                context: crate::lazy::LazyContext<'_>,
-            ) -> LazyOutput<E, Self::Output> {
-                let Self {
-                    mut iter,
-                    mut func,
-                    mut value,
-                } = self;
-
-                loop {
-                    let (next, new_iter) = run_lazy_inner!(iter.next(), context);
-                    iter = new_iter;
-
-                    let Some(next) = next else {
-                        break;
-                    };
-
-                    let t = run_lazy_inner!(next, context);
-                    match run_lazy_inner!(func(value, t), context) {
-                        Ok(new_value) => value = new_value,
-                        Err(err) => {
-                            return LazyOutput::pure((Err(err), iter));
-                        }
-                    }
-                }
-
-                LazyOutput::pure((Ok(value), iter))
-            }
-        }
-
-        Fold {
-            iter: self,
-            func: f,
-            value,
-        }
+                next.then(move |next_value| f(value, next_value).attach(f))
+                    .map(move |(f, value)| match value {
+                        Ok(value) => ControlFlow::Continue((value, f, iter)),
+                        Err(err) => ControlFlow::Break((Err(err), iter)),
+                    })
+                    .right()
+            })
+        })
     }
 
     fn try_fold<T, Er, F>(self, value: T, mut f: F) -> impl Lazy<E, Output = (Result<T, Er>, Self)>
