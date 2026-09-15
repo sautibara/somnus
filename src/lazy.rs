@@ -4,11 +4,13 @@ use auditeur::namespaced_id::NamespacedIdRef;
 use futures::{FutureExt, future::BoxFuture};
 use thiserror::Error;
 
+use crate::effect::breakability::Contains as _;
 use crate::{
     effect::{
-        self, Apply, BreakOut, Breakability, BreakabilityContains, Breakable, Contains, Effect,
-        Fallibility, FallibilityContains, Fallible, Immutable, Infallible, MakeBreak, MakePartial,
-        Mutable, Partial, Pure, Unbreakable,
+        self, Apply, Breakability, Breakable, Contains, Effect, Fallibility, Fallible, Immutable,
+        Infallible, MakePartial, Mutable, Partial, Pure, Unbreakable,
+        breakability::{self, BreakOut, MakeBreak},
+        fallibility,
     },
     global::GlobalState,
     module::Module,
@@ -69,8 +71,8 @@ impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
     fn with_effect<E2>(self) -> LazyOutput<E2, T>
     where
         E2: Effect<
-                Fallibility: FallibilityContains<E::Fallibility>,
-                Breakability: BreakabilityContains<E::Breakability>,
+                Fallibility: fallibility::Contains<E::Fallibility>,
+                Breakability: breakability::Contains<E::Breakability>,
             >,
     {
         LazyOutput {
@@ -209,8 +211,8 @@ pub trait Lazy<E: Effect>: Sized + Send + 'static {
     fn overwrite_exclusivity<E2>(self) -> impl Lazy<E2, Output = Self::Output>
     where
         E2: Effect<
-                Fallibility: FallibilityContains<E::Fallibility>,
-                Breakability: BreakabilityContains<E::Breakability>,
+                Fallibility: fallibility::Contains<E::Fallibility>,
+                Breakability: breakability::Contains<E::Breakability>,
             >,
     {
         struct AssertEffect<E1, L> {
@@ -222,8 +224,8 @@ pub trait Lazy<E: Effect>: Sized + Send + 'static {
         where
             E1: Effect,
             E2: Effect<
-                    Fallibility: FallibilityContains<E1::Fallibility>,
-                    Breakability: BreakabilityContains<E1::Breakability>,
+                    Fallibility: fallibility::Contains<E1::Fallibility>,
+                    Breakability: breakability::Contains<E1::Breakability>,
                 >,
             L: Lazy<E1>,
         {
