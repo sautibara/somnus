@@ -7,8 +7,8 @@ use thiserror::Error;
 use crate::effect::breakability::Contains as _;
 use crate::{
     effect::{
-        self, Apply, Breakability, Breakable, Contains, Effect, Fallibility, Fallible, Immutable,
-        Infallible, MakePartial, Mutable, Partial, Pure, Unbreakable,
+        self, Apply, Breakability, Breakable, Contains, Effect, Fallible, Immutable, Infallible,
+        MakePartial, Mutable, Partial, Pure,
         breakability::{self, BreakOut, MakeBreak},
         fallibility,
     },
@@ -58,14 +58,9 @@ impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
         }
     }
 
-    pub fn into_value(self) -> T
-    where
-        E: Effect<Fallibility: Fallibility<Error = !>, Breakability = Unbreakable>,
-    {
-        match self.value {
-            Ok(value) => value,
-            Err(never) => never,
-        }
+    #[allow(dead_code)]
+    pub(crate) fn into_value(self) -> effect::CleanOutput<T, E> {
+        effect::clean::<T, E>(self.value)
     }
 
     fn with_effect<E2>(self) -> LazyOutput<E2, T>
