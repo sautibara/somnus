@@ -25,10 +25,10 @@ use crate::{
 #[macro_export]
 #[doc(hidden)]
 macro_rules! run_lazy_inner {
-    ($val:expr, $context:expr) => {
-        match $val.get($context).await.extract() {
+    ($val:expr, $context:expr, &mut $artifacts:expr) => {
+        match $val.get($context).await.extract(&mut $artifacts) {
             Ok(value) => value,
-            Err(value) => return value,
+            Err(value) => return value.merge($artifacts),
         }
     };
 }
@@ -42,19 +42,30 @@ pub struct LazyContext<'a> {
 #[doc(hidden)]
 pub struct LazyOutput<E: Effect, T: Send + 'static> {
     value: effect::Output<T, E>,
+    artifacts: Artifacts,
 }
 
 impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
     pub(crate) fn pure(value: T) -> Self {
         Self {
             value: effect::pure::<T, E>(value),
+            artifacts: Artifacts::default(),
         }
     }
 
-    pub(crate) fn extract<O: Send + 'static>(self) -> Result<T, LazyOutput<E, O>> {
+    pub(crate) fn extract<O: Send + 'static>(
+        self,
+        artifacts: &mut Artifacts,
+    ) -> Result<T, LazyOutput<E, O>> {
         match effect::extract::<T, O, E>(self.value) {
-            Ok(value) => Ok(value),
-            Err(err) => Err(LazyOutput { value: err }),
+            Ok(value) => {
+                artifacts.merge(self.artifacts);
+                Ok(value)
+            }
+            Err(err) => Err(LazyOutput {
+                value: err,
+                artifacts: self.artifacts,
+            }),
         }
     }
 
@@ -72,33 +83,50 @@ impl<E: Effect, T: Send + 'static> LazyOutput<E, T> {
     {
         LazyOutput {
             value: self.value.map(E2::Breakability::map).map_err(Into::into),
+            artifacts: self.artifacts,
         }
     }
 
-    pub fn err<Er2: From<!> + Send + 'static>(err: Er2) -> Self
+    pub(crate) fn err<Er2: From<!> + Send + 'static>(err: Er2) -> Self
     where
         E: Contains<(Fallible<Er2>,)>,
     {
         Self {
             value: effect::error::<T, E, Er2>(err),
+            artifacts: Artifacts::default(),
         }
     }
 
-    pub const fn breaking(breaking: <E::Breakability as Breakability>::Wrap<T>) -> Self {
+    pub(crate) fn breaking(breaking: <E::Breakability as Breakability>::Wrap<T>) -> Self {
         Self {
             value: Ok(breaking),
+            artifacts: Artifacts::default(),
         }
     }
 
-    pub fn break_out<B>(value: B) -> Self
+    pub(crate) fn break_out<B>(value: B) -> Self
     where
         B: Send + 'static,
         E::Breakability: BreakOut<Outer = B>,
     {
         Self {
             value: Ok(E::Breakability::break_out(value)),
+            artifacts: Artifacts::default(),
         }
     }
+
+    pub(crate) fn merge(mut self, artifacts: Artifacts) -> Self {
+        self.artifacts.merge(artifacts);
+        self
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Artifacts {}
+
+impl Artifacts {
+    #[expect(warnings)]
+    fn merge(&mut self, other: Self) {}
 }
 
 #[must_use = "a Lazy value does nothing unless it is used"]
@@ -142,13 +170,16 @@ pub trait Lazy<E: Effect>: Sized + Send + 'static {
         {
             type Output = T2;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Self::Output> {
+                let mut artifacts = Artifacts::default();
+
                 let value = self.lazy.get(context).await;
-                let value = match value.extract() {
+                let value = match value.extract(&mut artifacts) {
                     Ok(value) => value,
                     Err(err) => return err,
                 };
+
                 let lazy = (self.then)(value);
-                lazy.get(context).await
+                lazy.get(context).await.merge(artifacts)
             }
         }
 
@@ -426,15 +457,17 @@ impl<T: Send + 'static, E: Effect> Laze<T, E> {
                     mut value,
                 } = self;
 
+                let mut artifacts = Artifacts::default();
+
                 let result = loop {
-                    let flow = run_lazy_inner!(func(value), context);
+                    let flow = run_lazy_inner!(func(value), context, &mut artifacts);
                     match flow {
                         ControlFlow::Continue(new_value) => value = new_value,
                         ControlFlow::Break(result) => break result,
                     }
                 };
 
-                LazyOutput::pure(result)
+                LazyOutput::pure(result).merge(artifacts)
             }
         }
 
@@ -595,11 +628,12 @@ pub trait LazyOption<E: Effect>: Lazy<E, Output = Option<Self::Inner>> {
         {
             type Output = Option<T2>;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Option<T2>> {
-                let Some(value) = run_lazy_inner!(self.lazy, context) else {
-                    return LazyOutput::pure(None);
+                let mut artifacts = Artifacts::default();
+                let Some(value) = run_lazy_inner!(self.lazy, context, &mut artifacts) else {
+                    return LazyOutput::pure(None).merge(artifacts);
                 };
                 let lazy = (self.then)(value);
-                lazy.get(context).await
+                lazy.get(context).await.merge(artifacts)
             }
         }
 
@@ -648,14 +682,15 @@ pub trait LazyResult<E: Effect>: Lazy<E, Output = Result<Self::Inner, Self::Erro
         {
             type Output = Result<T2, Err>;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Result<T2, Err>> {
-                let value = match run_lazy_inner!(self.lazy, context) {
+                let mut artifacts = Artifacts::default();
+                let value = match run_lazy_inner!(self.lazy, context, &mut artifacts) {
                     Ok(value) => value,
                     Err(err) => {
-                        return LazyOutput::pure(Err(err));
+                        return LazyOutput::pure(Err(err)).merge(artifacts);
                     }
                 };
                 let lazy = (self.then)(value);
-                lazy.get(context).await
+                lazy.get(context).await.merge(artifacts)
             }
         }
 
@@ -680,9 +715,10 @@ pub trait LazyResult<E: Effect>: Lazy<E, Output = Result<Self::Inner, Self::Erro
         {
             type Output = T;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Self::Output> {
-                match run_lazy_inner!(self.0, context) {
-                    Ok(value) => LazyOutput::pure(value),
-                    Err(err) => LazyOutput::err(err),
+                let mut artifacts = Artifacts::default();
+                match run_lazy_inner!(self.0, context, &mut artifacts) {
+                    Ok(value) => LazyOutput::pure(value).merge(artifacts),
+                    Err(err) => LazyOutput::err(err).merge(artifacts),
                 }
             }
         }
@@ -744,9 +780,10 @@ where
         {
             type Output = Result<L::Output, Err>;
             async fn get(self, context: LazyContext<'_>) -> LazyOutput<E, Self::Output> {
+                let mut artifacts = Artifacts::default();
                 let value = self.lazy.get(context).await;
-                match value.extract().map_err(|err| err.value) {
-                    Ok(value) => LazyOutput::pure(Ok(value)),
+                match value.extract(&mut artifacts).map_err(|err| err.value) {
+                    Ok(value) => LazyOutput::pure(Ok(value)).merge(artifacts),
                     Err(Ok(breaking)) => LazyOutput::breaking(breaking),
                     Err(Err(error)) => LazyOutput::pure(Err(error)),
                 }
