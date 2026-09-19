@@ -504,6 +504,38 @@ pub trait LazyIter<E: Effect>:
         })
     }
 
+    fn filter_map_lazy<L, F, T>(self, f: F) -> impl LazyIter<E, Item = T>
+    where
+        F: Fn(Self::Item) -> L + Clone + Send + 'static,
+        L: Lazy<E, Output = Option<T>>,
+        T: Send + 'static,
+    {
+        self.map_lazy(f).flatten()
+    }
+
+    fn filter_map<F, T>(self, f: F) -> impl LazyIter<E, Item = T>
+    where
+        F: Fn(Self::Item) -> Option<T> + Clone + Send + 'static,
+        T: Send + 'static,
+    {
+        self.filter_map_lazy(move |item| Laze::just(f(item)))
+    }
+
+    fn filter_lazy<L, F>(self, f: F) -> impl LazyIter<E, Item = Self::Item>
+    where
+        F: Fn(&Self::Item) -> L + Clone + Send + 'static,
+        L: Lazy<E, Output = bool>,
+    {
+        self.filter_map_lazy(move |value| f(&value).map(move |success| success.then_some(value)))
+    }
+
+    fn filter<F>(self, f: F) -> impl LazyIter<E, Item = Self::Item>
+    where
+        F: Fn(&Self::Item) -> bool + Clone + Send + 'static,
+    {
+        self.filter_map(move |value| f(&value).then_some(value))
+    }
+
     fn any_lazy<L, F>(self, mut f: F) -> impl Lazy<E, Output = (bool, Self)>
     where
         F: FnMut(Self::Item) -> L + Send + 'static,
@@ -712,6 +744,93 @@ impl<E: Effect, T: Send + 'static> LazeIter<E, T> {
     pub fn once(value: T) -> impl LazyIter<E, Item = T> {
         Self::from_iter(std::iter::once(value))
     }
+
+    pub fn once_lazy<L>(lazy: L) -> impl LazyIter<E, Item = T>
+    where
+        L: Lazy<E, Output = T>,
+    {
+        struct Once<L>(Option<L>);
+
+        impl<E, L, T> LazyIter<E> for Once<L>
+        where
+            E: Effect,
+            L: Lazy<E, Output = T>,
+            T: Send + 'static,
+        {
+            type Item = T;
+
+            fn next(
+                self,
+            ) -> impl Lazy<E, Output = (Option<impl Lazy<E, Output = Self::Item>>, Self)>
+            {
+                let Self(lazy) = self;
+                Laze::just((lazy, Self(None)))
+            }
+        }
+
+        impl<E, L, T> IntoLazyIter<E> for Once<L>
+        where
+            E: Effect,
+            L: Lazy<E, Output = T>,
+            T: Send + 'static,
+        {
+            type IntoItem = T;
+            fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
+                self
+            }
+        }
+
+        Once(Some(lazy))
+    }
+
+    pub fn from_lazy<L, I>(lazy: L) -> impl LazyIter<E, Item = T>
+    where
+        L: Lazy<E, Output = I>,
+        I: IntoLazyIter<E, IntoItem = T>,
+    {
+        enum FromLazy<L, I> {
+            Lazy(L),
+            Iter(I),
+        }
+
+        impl<E, T, L, I> LazyIter<E> for FromLazy<L, I>
+        where
+            E: Effect,
+            T: Send + 'static,
+            L: Lazy<E, Output = I>,
+            I: LazyIter<E, Item = T>,
+        {
+            type Item = T;
+
+            fn next(self) -> impl Lazy<E, Output = (Option<impl Lazy<E, Output = T>>, Self)> {
+                match self {
+                    Self::Lazy(lazy) => lazy
+                        .then(|iter| iter.next().map(|(next, iter)| (next, Self::Iter(iter))))
+                        .left(),
+                    Self::Iter(iter) => iter
+                        .next()
+                        .map(|(next, iter)| (next, Self::Iter(iter)))
+                        .right(),
+                }
+            }
+        }
+
+        impl<E, T, L, I> IntoLazyIter<E> for FromLazy<L, I>
+        where
+            E: Effect,
+            T: Send + 'static,
+            L: Lazy<E, Output = I>,
+            I: LazyIter<E, Item = T>,
+        {
+            type IntoItem = T;
+
+            fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
+                self
+            }
+        }
+
+        FromLazy::Lazy(lazy.map(IntoLazyIter::into_lazy_iter))
+    }
 }
 
 pub trait IntoLazyIter<E: Effect>: Send + 'static {
@@ -775,6 +894,17 @@ where
     E: Effect,
     T: Send + 'static,
     Self: Iterator<Item = T>,
+{
+    type IntoItem = T;
+    fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
+        LazeIter::from_iter(self)
+    }
+}
+
+impl<E, T> IntoLazyIter<E> for Option<T>
+where
+    E: Effect,
+    T: Send + 'static,
 {
     type IntoItem = T;
     fn into_lazy_iter(self) -> impl LazyIter<E, Item = Self::IntoItem> {
@@ -906,7 +1036,7 @@ mod tests {
         effect::{self, Effect, Infallible, Unbreakable},
         global::GlobalState,
         iter::{IntoLazyIter, LazeIter, LazyIter},
-        lazy::{Lazy, LazyContext},
+        lazy::{Laze, Lazy, LazyContext},
     };
 
     async fn cmp<E, IL, IR, T>(left: IL, right: IR) -> std::cmp::Ordering
@@ -1151,5 +1281,41 @@ mod tests {
 
         assert_any_eq(attach_marker([false], &ran_marker, true), true).await;
         assert!(ran_marker.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn flatten_simple() {
+        assert_iter_cmp_eq!(
+            vec![vec![1, 2], vec![3, 4]].into_lazy_iter().flatten(),
+            vec![1, 2, 3, 4]
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn flat_map_simple() {
+        assert_iter_cmp_eq!(
+            vec!["he", "", "l", "lo"]
+                .into_lazy_iter()
+                .flat_map(|string| LazeIter::from_iter(string.chars())),
+            vec!['h', 'e', 'l', 'l', 'o']
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn iter_from_lazy_simple() {
+        assert_iter_cmp_eq!(LazeIter::from_lazy(Laze::just(vec![1, 2])), vec![1, 2]).await;
+    }
+
+    #[tokio::test]
+    async fn filter() {
+        assert_iter_cmp_eq!(
+            vec![1, 2, 3, 4]
+                .into_lazy_iter()
+                .filter(|value| *value % 2 == 0),
+            vec![2, 4]
+        )
+        .await;
     }
 }
