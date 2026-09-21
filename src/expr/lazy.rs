@@ -16,12 +16,6 @@ use crate::{
     module::Module,
 };
 
-// TODO: Lazy::looping - accepts an fn that takes in some Continue lazy
-// - implements this by adding a new looping effect
-// - may have multiple loops by stacking effects
-// - continue lazy actually returns some break output that continues the loop
-//   - can't have a recursive function because we can't use the lazy's output (since it breaks)
-
 #[macro_export]
 #[doc(hidden)]
 macro_rules! run_lazy_inner {
@@ -868,8 +862,8 @@ impl From<!> for ModuleError {
 mod tests {
     use crate::{
         effect::{self, Effect, Fallible, Pure},
+        expr::lazy::{Laze, Lazy, LazyContext, LazyFallible, LazyResult},
         global::GlobalState,
-        lazy::{Laze, Lazy, LazyContext, LazyFallible, LazyResult},
     };
 
     async fn run<E: Effect, L: Lazy<E, Output = T>, T: Send + 'static>(

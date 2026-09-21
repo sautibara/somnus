@@ -7,10 +7,8 @@
 pub mod data;
 pub mod effect;
 pub mod error;
-pub mod func;
+pub mod expr;
 pub mod global;
-pub mod iter;
-pub mod lazy;
 pub mod module;
 
 pub use error::Error;

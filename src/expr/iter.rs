@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt};
 
 use crate::{
     effect::Effect,
-    lazy::{Laze, Lazy, LazyOption, OptionLazyExt},
+    expr::lazy::{Laze, Lazy, LazyOption, OptionLazyExt},
 };
 
 #[must_use = "a LazyIter value does nothing unless it is used"]
@@ -1034,9 +1034,11 @@ mod tests {
 
     use crate::{
         effect::{self, Effect, Infallible, Unbreakable},
+        expr::{
+            iter::{IntoLazyIter, LazeIter, LazyIter},
+            lazy::{Laze, Lazy, LazyContext},
+        },
         global::GlobalState,
-        iter::{IntoLazyIter, LazeIter, LazyIter},
-        lazy::{Laze, Lazy, LazyContext},
     };
 
     async fn cmp<E, IL, IR, T>(left: IL, right: IR) -> std::cmp::Ordering

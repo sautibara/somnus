@@ -1,6 +1,6 @@
 use crate::{
     effect::{Contains, Effect},
-    lazy::{BoxLazy, Lazy},
+    expr::lazy::{BoxLazy, Lazy},
 };
 
 pub trait LazyFn<E: Effect, Args: Send + 'static>: Sized + Send + 'static {
