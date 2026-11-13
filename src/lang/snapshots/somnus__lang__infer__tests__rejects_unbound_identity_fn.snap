@@ -1,0 +1,58 @@
+---
+source: somnus/src/lang/infer.rs
+expression: type_infer(expr)
+---
+InferOut {
+    expr: Fun {
+        id: NodeId(
+            1,
+        ),
+        param: TypedVar(
+            Var(
+                0,
+            ),
+            Var(
+                TypeVar(
+                    0,
+                ),
+            ),
+        ),
+        body: Var {
+            id: NodeId(
+                0,
+            ),
+            value: TypedVar(
+                Var(
+                    0,
+                ),
+                Var(
+                    TypeVar(
+                        0,
+                    ),
+                ),
+            ),
+        },
+    },
+    ty: Fun {
+        arg: Var(
+            TypeVar(
+                0,
+            ),
+        ),
+        ret: Var(
+            TypeVar(
+                0,
+            ),
+        ),
+    },
+    errors: {
+        NodeId(
+            1,
+        ): Error {
+            node: NodeId(
+                1,
+            ),
+            kind: FreeTypeVariable,
+        },
+    },
+}

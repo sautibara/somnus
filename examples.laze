@@ -1,0 +1,2 @@
+
+core:queue:new(song -> song.in_queue("core:library").and(song.artist().is("Toby Fox")))

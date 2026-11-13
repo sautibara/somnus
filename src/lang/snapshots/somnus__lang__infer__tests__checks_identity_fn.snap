@@ -1,0 +1,41 @@
+---
+source: somnus/src/lang/infer.rs
+expression: "type_check(expr, ty)"
+---
+InferOut {
+    expr: Fun {
+        id: NodeId(
+            1,
+        ),
+        param: TypedVar(
+            Var(
+                0,
+            ),
+            Prim(
+                Number,
+            ),
+        ),
+        body: Var {
+            id: NodeId(
+                0,
+            ),
+            value: TypedVar(
+                Var(
+                    0,
+                ),
+                Prim(
+                    Number,
+                ),
+            ),
+        },
+    },
+    ty: Fun {
+        arg: Prim(
+            Number,
+        ),
+        ret: Prim(
+            Number,
+        ),
+    },
+    errors: {},
+}

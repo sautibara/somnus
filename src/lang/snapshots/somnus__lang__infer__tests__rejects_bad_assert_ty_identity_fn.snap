@@ -1,0 +1,70 @@
+---
+source: somnus/src/lang/infer.rs
+expression: type_infer(expr)
+---
+InferOut {
+    expr: AssertTy {
+        id: NodeId(
+            2,
+        ),
+        body: Fun {
+            id: NodeId(
+                1,
+            ),
+            param: TypedVar(
+                Var(
+                    0,
+                ),
+                Prim(
+                    String,
+                ),
+            ),
+            body: Var {
+                id: NodeId(
+                    0,
+                ),
+                value: TypedVar(
+                    Var(
+                        0,
+                    ),
+                    Prim(
+                        String,
+                    ),
+                ),
+            },
+        },
+        ty: Fun {
+            arg: Prim(
+                String,
+            ),
+            ret: Prim(
+                Number,
+            ),
+        },
+    },
+    ty: Fun {
+        arg: Prim(
+            String,
+        ),
+        ret: Prim(
+            Number,
+        ),
+    },
+    errors: {
+        NodeId(
+            0,
+        ): Error {
+            node: NodeId(
+                0,
+            ),
+            kind: TypeNotEqual(
+                Prim(
+                    Number,
+                ),
+                Prim(
+                    String,
+                ),
+            ),
+        },
+    },
+}

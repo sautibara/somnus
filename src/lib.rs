@@ -9,6 +9,7 @@ pub mod effect;
 pub mod error;
 pub mod expr;
 pub mod global;
+pub mod lang;
 pub mod module;
 
 pub use error::Error;

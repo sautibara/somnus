@@ -1,0 +1,30 @@
+---
+source: somnus/src/lang/infer.rs
+expression: type_infer(expr)
+---
+InferOut {
+    expr: Primitive {
+        id: NodeId(
+            0,
+        ),
+        value: Number(
+            FBig {
+                significand: 1 (1 bits),
+                exponent: 2 ^ 0,
+                precision: 1,
+                rounding: Zero,
+            },
+        ),
+    },
+    ty: Const(
+        Number(
+            FBig {
+                significand: 1 (1 bits),
+                exponent: 2 ^ 0,
+                precision: 1,
+                rounding: Zero,
+            },
+        ),
+    ),
+    errors: {},
+}
